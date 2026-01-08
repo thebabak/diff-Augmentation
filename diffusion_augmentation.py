@@ -66,25 +66,26 @@ class AttentionBlock(nn.Module):
         self.proj_out = nn.Conv2d(channels, channels, 1)
         
     def forward(self, x):
-        h = self.norm(x)
-        q = self.q(h)
-        k = self.k(h)
-        v = self.v(h)
+        residual = x
+        x_norm = self.norm(x)
+        q = self.q(x_norm)
+        k = self.k(x_norm)
+        v = self.v(x_norm)
         
         # Compute attention
-        b, c, h, w = q.shape
-        q = q.reshape(b, c, h * w).permute(0, 2, 1)
-        k = k.reshape(b, c, h * w)
-        v = v.reshape(b, c, h * w).permute(0, 2, 1)
+        b, c, height, width = q.shape
+        q = q.reshape(b, c, height * width).permute(0, 2, 1)
+        k = k.reshape(b, c, height * width)
+        v = v.reshape(b, c, height * width).permute(0, 2, 1)
         
         attn = torch.bmm(q, k) * (c ** -0.5)
         attn = F.softmax(attn, dim=-1)
         
-        h = torch.bmm(attn, v)
-        h = h.permute(0, 2, 1).reshape(b, c, h, w)
-        h = self.proj_out(h)
+        out = torch.bmm(attn, v)
+        out = out.permute(0, 2, 1).reshape(b, c, height, width)
+        out = self.proj_out(out)
         
-        return x + h
+        return residual + out
 
 
 class ConditionalUNet(nn.Module):
@@ -108,6 +109,7 @@ class ConditionalUNet(nn.Module):
         self.model_channels = model_channels
         self.out_channels = out_channels
         self.num_res_blocks = num_res_blocks
+        self.channel_mult = channel_mult
         
         time_emb_dim = model_channels * 4
         self.time_mlp = nn.Sequential(
@@ -143,11 +145,10 @@ class ConditionalUNet(nn.Module):
                 input_block_chans.append(ch)
             
             if level != len(channel_mult) - 1:
-                self.encoder_downs.append(nn.Conv2d(ch, ch, 3, stride=2, padding=1))
+                down_op = nn.Conv2d(ch, ch, 3, stride=2, padding=1)
+                self.encoder_downs.append(down_op)
                 input_block_chans.append(ch)
                 ds *= 2
-            else:
-                self.encoder_downs.append(nn.Identity())
         
         # Middle
         self.middle_block1 = ResidualBlock(ch, ch, time_emb_dim)
@@ -199,12 +200,16 @@ class ConditionalUNet(nn.Module):
         
         # Encoder
         hs = [h]
-        for block, attn, down in zip(self.encoder_blocks, self.encoder_attns, self.encoder_downs):
-            h = block(h, t_emb)
-            h = attn(h)
-            hs.append(h)
-            h = down(h)
-            if not isinstance(down, nn.Identity):
+        block_idx = 0
+        for level, mult in enumerate(self.channel_mult):
+            for _ in range(self.num_res_blocks):
+                h = self.encoder_blocks[block_idx](h, t_emb)
+                h = self.encoder_attns[block_idx](h)
+                block_idx += 1
+                hs.append(h)
+            
+            if level != len(self.channel_mult) - 1:
+                h = self.encoder_downs[level](h)
                 hs.append(h)
         
         # Middle
@@ -213,11 +218,14 @@ class ConditionalUNet(nn.Module):
         h = self.middle_block2(h, t_emb)
         
         # Decoder
-        for block, attn, up in zip(self.decoder_blocks, self.decoder_attns, self.decoder_ups):
-            h = torch.cat([h, hs.pop()], dim=1)
-            h = block(h, t_emb)
-            h = attn(h)
-            h = up(h)
+        block_idx = 0
+        for level in reversed(range(len(self.channel_mult))):
+            for i in range(self.num_res_blocks + 1):
+                h = torch.cat([h, hs.pop()], dim=1)
+                h = self.decoder_blocks[block_idx](h, t_emb)
+                h = self.decoder_attns[block_idx](h)
+                h = self.decoder_ups[block_idx](h)
+                block_idx += 1
         
         h = self.out_norm(h)
         h = F.relu(h)

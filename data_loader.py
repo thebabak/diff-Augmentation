@@ -53,9 +53,9 @@ class RetinalVesselDataset(Dataset):
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.5),
                 A.RandomRotate90(p=0.5),
-                A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
+                A.Affine(scale=(0.9, 1.1), translate_percent=(-0.1, 0.1), rotate=(-15, 15), p=0.5),
                 A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-                A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+                A.GaussNoise(p=0.3),
                 A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) if self.normalize else A.NoOp(),
                 ToTensorV2()
             ])
@@ -71,12 +71,16 @@ class RetinalVesselDataset(Dataset):
         # Common mask naming patterns
         image_stem = image_file.stem
         
+        # Extract base number (e.g., "21" from "21_training")
+        base_name = image_stem.split('_')[0]
+        
         # Try different patterns
         patterns = [
             f"{image_stem}_mask",
             f"{image_stem}_1stHO",
             f"{image_stem}_manual1",
-            f"{image_stem.split('_')[0]}_1stHO",
+            f"{base_name}_manual1",
+            f"{base_name}_1stHO",
             image_stem
         ]
         
@@ -92,20 +96,22 @@ class RetinalVesselDataset(Dataset):
         return len(self.image_files)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Load image
+        # Load image using PIL to avoid encoding issues
+        from PIL import Image
         image_path = self.image_files[idx]
-        image = cv2.imread(str(image_path))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = Image.open(str(image_path)).convert('RGB')
+        image = np.array(image)
         
         # Load mask
         mask_path = self._find_mask_file(image_path)
         if mask_path is None:
             raise FileNotFoundError(f"Mask not found for image: {image_path}")
         
-        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        mask = Image.open(str(mask_path)).convert('L')
+        mask = np.array(mask)
         
         # Binarize mask
-        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+        mask = (mask > 127).astype(np.uint8) * 255
         
         # Apply transformations
         transformed = self.transform(image=image, mask=mask)
@@ -122,8 +128,20 @@ class DRIVEDataset(RetinalVesselDataset):
     """DRIVE dataset specific loader"""
     
     def __init__(self, root_dir: str, split: str = 'training', **kwargs):
-        image_dir = os.path.join(root_dir, split, 'images')
-        mask_dir = os.path.join(root_dir, split, '1st_manual')
+        # Handle different DRIVE directory structures
+        import os
+        
+        # Check if root_dir already contains split subdirectory
+        if os.path.exists(os.path.join(root_dir, 'images')):
+            # root_dir already points to training/test directory
+            image_dir = os.path.join(root_dir, 'images')
+            mask_dir = os.path.join(root_dir, '1st_manual')
+        elif os.path.exists(os.path.join(root_dir, split, 'images')):
+            # root_dir is parent, need to add split
+            image_dir = os.path.join(root_dir, split, 'images')
+            mask_dir = os.path.join(root_dir, split, '1st_manual')
+        else:
+            raise FileNotFoundError(f"Cannot find images directory in {root_dir}")
         super().__init__(image_dir, mask_dir, **kwargs)
 
 
@@ -166,7 +184,7 @@ class HRFDataset(Dataset):
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.5),
                 A.RandomRotate90(p=0.5),
-                A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
+                A.Affine(scale=(0.9, 1.1), translate_percent=(-0.1, 0.1), rotate=(-15, 15), p=0.5),
                 A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
                 A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) if self.normalize else A.NoOp(),
                 ToTensorV2()
@@ -282,7 +300,9 @@ def get_data_loaders(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None
     )
     
     val_loader = DataLoader(
@@ -290,7 +310,9 @@ def get_data_loaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None
     ) if val_dataset is not None else None
     
     return train_loader, val_loader
